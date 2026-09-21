@@ -1,0 +1,1114 @@
+// ═══════════════════════════════════════════════════════════════
+// MANIFEST PROCESSOR v19.2 (Hybrid – Tampermonkey + Local Overrides)
+// Paste sa DULO ng main.js (o kahit anong JS file na ni-override)
+// ═══════════════════════════════════════════════════════════════
+(function () {
+    'use strict';
+
+    const hasGM = (typeof GM_setValue === 'function');
+    console.log('[MP] Storage mode:', hasGM ? 'Tampermonkey' : 'Local Overrides');
+
+    const Store = {
+        set: (k, v) => { try { if (hasGM) GM_setValue(k, v); else localStorage.setItem('mp_' + k, v); } catch (e) {} },
+        get: (k, def) => {
+            try {
+                if (hasGM) { const v = GM_getValue(k); return v === undefined ? def : v; }
+                const v = localStorage.getItem('mp_' + k);
+                return v === null ? def : v;
+            } catch (e) { return def; }
+        },
+        del: (k) => { try { if (hasGM) GM_deleteValue(k); else localStorage.removeItem('mp_' + k); } catch (e) {} },
+        clipboard: (text) => {
+            try {
+                if (hasGM && typeof GM_setClipboard === 'function') GM_setClipboard(text);
+                else if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text);
+                else {
+                    const ta = document.createElement('textarea');
+                    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+                    document.body.appendChild(ta); ta.select();
+                    document.execCommand('copy'); document.body.removeChild(ta);
+                }
+            } catch (e) {}
+        }
+    };
+
+    (function earlySuppression() {
+        try {
+            if (localStorage.getItem('mp_auto_login') !== 'true') return;
+            const noop = () => undefined;
+            const yes = () => true;
+            const nullFn = () => null;
+            try {
+                Object.defineProperty(window, 'alert', { value: noop, writable: false, configurable: false });
+                Object.defineProperty(window, 'confirm', { value: yes, writable: false, configurable: false });
+                Object.defineProperty(window, 'prompt', { value: nullFn, writable: false, configurable: false });
+            } catch (e) {}
+
+            if (location.href.includes('Announcement.aspx')) {
+                const base = location.origin + location.pathname.replace(/\/[^/]*$/, '');
+                location.replace(base + '/PostingPZ.aspx');
+            }
+        } catch (e) {}
+    })();
+
+    const START = Date.now();
+    function tryRun() {
+        if (typeof jQuery === 'undefined') {
+            if (Date.now() - START > 30000) { console.warn('[MP] jQuery timeout'); return; }
+            return setTimeout(tryRun, 300);
+        }
+        if (!document.body) {
+            if (Date.now() - START > 30000) return;
+            return setTimeout(tryRun, 300);
+        }
+        console.log('[MP] jQuery + DOM ready');
+        runMain();
+    }
+
+    function runMain() {
+        const $ = jQuery;
+
+        const CONFIG = {
+            stepDelay: 1200,
+            maxWaitTime: 20000,
+            slowMaxWaitTime: 90000,
+            slowBack2Wait: 8000,
+            storageKey: "manifestProcessorState",
+            dataStorageKey: "manifestDataStore",
+            queueBackupKey: "linkQueueStore",
+        };
+
+        const ACCOUNTS_KEY = 'mp_bulk_accounts';
+        const SELECTED_ACCOUNT_KEY = 'mp_selected_account';
+        const AUTO_LOGIN_KEY = 'mp_auto_login';
+        const LOGIN_ATTEMPTS_KEY = 'mp_login_attempts';
+
+        const getAccounts = () => { try { return JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '[]'); } catch { return []; } };
+        const saveAccounts = (a) => localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(a));
+        const getSelectedAccount = () => { try { return JSON.parse(localStorage.getItem(SELECTED_ACCOUNT_KEY) || 'null'); } catch { return null; } };
+        const setSelectedAccount = (idx) => localStorage.setItem(SELECTED_ACCOUNT_KEY, JSON.stringify(idx));
+        const getAutoLogin = () => localStorage.getItem(AUTO_LOGIN_KEY) === 'true';
+        const setAutoLogin = (v) => localStorage.setItem(AUTO_LOGIN_KEY, v ? 'true' : 'false');
+        const getLoginAttempts = () => parseInt(localStorage.getItem(LOGIN_ATTEMPTS_KEY) || '0');
+        const setLoginAttempts = (n) => localStorage.setItem(LOGIN_ATTEMPTS_KEY, String(n));
+        const clearLoginAttempts = () => localStorage.removeItem(LOGIN_ATTEMPTS_KEY);
+        const getBaseUrl = () => location.origin + location.pathname.replace(/\/[^/]*$/, '');
+        const getLoginUrl = () => getBaseUrl() + '/Login.aspx';
+        const getPostingPZUrl = () => getBaseUrl() + '/PostingPZ.aspx';
+
+        const INITIAL_STATE = {
+            currentManifest: null, currentStep: null,
+            completedManifests: [], pendingManifests: [],
+            processing: false, panelVisible: true,
+            slowInternet: false, linkMethod: false,
+            linkQueue: [], linkIndex: 0, stuckCount: 0,
+        };
+
+        let state = JSON.parse(JSON.stringify(INITIAL_STATE));
+        try {
+            const saved = Store.get(CONFIG.storageKey);
+            if (saved) state = JSON.parse(saved);
+        } catch (e) {}
+
+        // ═══════════════════════════════════════════════════
+        // AUTO LOGIN FLOW
+        // ═══════════════════════════════════════════════════
+        function isOnLoginPage() {
+            return location.href.includes('Login.aspx') || !!document.getElementById('MainContent_txtusername');
+        }
+        function isOnAnnouncementPage() { return location.href.includes('Announcement.aspx'); }
+        function isOnPostingPZPage() {
+            return location.href.includes('PostingPZ.aspx') || !!document.querySelector('tr[onclick*="ShowEdit"]');
+        }
+
+        async function handleAutoLoginFlow() {
+            applyAlertSuppression();
+
+            if (isOnLoginPage()) {
+                const accounts = getAccounts();
+                const idx = getSelectedAccount();
+                if (idx === null || idx < 0 || idx >= accounts.length) {
+                    setAutoLogin(false);
+                    clearLoginAttempts();
+                    initPanel();
+                    setTimeout(() => checkProcessingState(), 800);
+                    setupHotkey();
+                    return;
+                }
+
+                const attempts = getLoginAttempts();
+
+                if (attempts >= 2) {
+                    console.warn('[MP] Login failed twice – stopping');
+                    setAutoLogin(false);
+                    clearLoginAttempts();
+                    initPanel();
+                    setupHotkey();
+
+                    const logEl = document.getElementById('log');
+                    if (logEl) {
+                        logEl.innerHTML = `<div style="color:#c33;font-weight:bold;padding:6px;font-size:12px;">
+                            ❌ LOGIN FAILED TWICE (wrong password or branch code).<br>
+                            Auto-login stopped.<br>
+                            Check credentials in ⚙ Manage Accounts.
+                        </div>` + logEl.innerHTML;
+                    }
+                    setStatus('❌ Login failed – check credentials');
+                    alert('❌ Login failed twice. Auto-login stopped.');
+                    return;
+                }
+
+                const acc = accounts[idx];
+                const ready = await waitForElement('#MainContent_txtusername', 20000);
+                if (!ready) { setAutoLogin(false); clearLoginAttempts(); return; }
+
+                setLoginAttempts(attempts + 1);
+                console.log('[MP] Login attempt #' + (attempts + 1) + ' for ' + acc.username);
+
+                document.getElementById('MainContent_txtusername').value = acc.username;
+                document.getElementById('MainContent_txtpassword').value = acc.password;
+                document.getElementById('MainContent_txtbranchcode').value = acc.branchCode;
+
+                await delay(400);
+                document.getElementById('MainContent_btnLogin').click();
+                return;
+            }
+
+            if (isOnAnnouncementPage()) {
+                clearLoginAttempts();
+                location.replace(getPostingPZUrl());
+                return;
+            }
+
+            if (isOnPostingPZPage()) {
+                clearLoginAttempts();
+                setAutoLogin(false);
+                initPanel();
+                setupHotkey();
+                await delay(1500);
+                start();
+                return;
+            }
+
+            location.replace(getPostingPZUrl());
+        }
+
+        function waitForElement(sel, t = 20000) {
+            return new Promise((resolve) => {
+                const start = Date.now();
+                const i = setInterval(() => {
+                    if (document.querySelector(sel)) { clearInterval(i); resolve(true); }
+                    if (Date.now() - start > t) { clearInterval(i); resolve(false); }
+                }, 300);
+            });
+        }
+
+        function applyAlertSuppression() {
+            const noop = () => undefined;
+            const yes = () => true;
+            const nullFn = () => null;
+            function tryLock(w) {
+                if (!w) return;
+                try {
+                    const desc = Object.getOwnPropertyDescriptor(w, 'alert');
+                    if (desc && desc.writable === false && desc.configurable === false) return;
+                } catch (e) {}
+                try {
+                    Object.defineProperty(w, 'alert', { value: noop, writable: false, configurable: false });
+                    Object.defineProperty(w, 'confirm', { value: yes, writable: false, configurable: false });
+                    Object.defineProperty(w, 'prompt', { value: nullFn, writable: false, configurable: false });
+                } catch (e) {
+                    try { w.alert = noop; } catch (_) {}
+                    try { w.confirm = yes; } catch (_) {}
+                    try { w.prompt = nullFn; } catch (_) {}
+                }
+            }
+            try { tryLock(window); } catch (e) {}
+        }
+
+        // ═══════════════════════════════════════════════════
+        // INIT
+        // ═══════════════════════════════════════════════════
+        if (getAutoLogin()) {
+            handleAutoLoginFlow();
+            return;
+        }
+
+        initPanel();
+        setTimeout(() => checkProcessingState(), 800);
+        setupHotkey();
+
+        // ═══════════════════════════════════════════════════
+        // HOTKEY
+        // ═══════════════════════════════════════════════════
+        function setupHotkey() {
+            document.addEventListener("keydown", (e) => {
+                if (e.ctrlKey && e.altKey && e.key.toLowerCase() === "z") togglePanel();
+            }, true);
+        }
+        function togglePanel() {
+            state.panelVisible = !state.panelVisible;
+            $("#ctrl-panel-container").toggle();
+            persist();
+        }
+
+        // ═══════════════════════════════════════════════════
+        // PANEL
+        // ═══════════════════════════════════════════════════
+        function initPanel() {
+            if (document.getElementById('ctrl-panel-container')) return;
+
+            const panel = `
+                <div id="ctrl-panel-container" style="position:fixed;top:10px;right:10px;background:#fff;border:2px solid #4CAF50;border-radius:10px;padding:14px;z-index:99999;width:380px;font-family:Arial;box-shadow:0 4px 12px rgba(0,0,0,0.15)">
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <b style="font-size:16px;color:#333;">Manifest Processor</b>
+                        <span id="stepLabel" style="font-size:10px;color:#999;"></span>
+                    </div>
+                    <div style="margin-top:8px;position:relative;">
+                        <label style="font-size:11px;color:#666;">Account:</label>
+                        <input id="acct-search" type="text" placeholder="🔍 Search name..." autocomplete="off"
+                            style="width:100%;padding:6px 8px;background:#f0f0f0;color:#333;border:1px solid #bbb;border-radius:4px;font-size:12px;margin-top:3px;box-sizing:border-box;">
+                        <div id="acct-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;max-height:200px;overflow-y:auto;background:#fff;border:1px solid #bbb;border-radius:4px;box-shadow:0 4px 10px rgba(0,0,0,0.15);z-index:10;margin-top:2px;font-size:12px;"></div>
+                        <button id="acct-manage" style="margin-top:4px;padding:5px 8px;background:#1976d2;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">⚙ Manage / Bulk Accounts</button>
+                    </div>
+                    <div style="margin-top:8px;">
+                        <button id="btn-login-start" style="width:100%;padding:8px;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">▶ LOGIN & START</button>
+                    </div>
+                    <div id="dateTimeBox" style="margin-top:10px;padding:8px;background:linear-gradient(135deg,#4CAF50,#2e7d32);color:#fff;border-radius:8px;text-align:center;">
+                        <div id="timeDisplay" style="font-size:18px;font-weight:bold;"></div>
+                        <div id="dateDisplay" style="font-size:12px;opacity:0.9;"></div>
+                    </div>
+                    <div id="statusBox" style="margin-top:10px;padding:8px;background:#eef7ee;border-left:4px solid #4CAF50;border-radius:6px;font-size:11px;color:#333;">
+                        <div><b>Current:</b> <span id="currentManifestLabel">-</span></div>
+                        <div><b>Progress:</b> <span id="progressLabel">0 / 0</span></div>
+                        <div><b>Status:</b> <span id="statusLabel">IDLE</span></div>
+                    </div>
+                    <div id="totalDisplay" style="margin-top:10px;">Total Items: 0</div><br>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                        <button id="btn-start">Start</button>
+                        <button id="btn-pause">Pause</button>
+                        <button id="btn-reset">Reset</button>
+                        <button id="btn-copy">Copy</button>
+                        <button id="btn-skip" style="background:#ff9800;display:none;">Skip</button>
+                    </div>
+                    <div style="margin-top:8px;font-size:12px;display:flex;flex-direction:column;gap:4px;">
+                        <label style="cursor:pointer;"><input type="checkbox" id="chk-slow-internet" ${state.slowInternet ? 'checked' : ''}> Slow Internet Mode</label>
+                        <label style="cursor:pointer;"><input type="checkbox" id="chk-link-method" ${state.linkMethod ? 'checked' : ''}> Use Link Method</label>
+                    </div>
+                    <div id="log" style="margin-top:10px;max-height:180px;overflow:auto;font-size:11px;background:#f9f9f9;padding:6px;border-radius:6px;border:1px solid #ddd;"></div>
+                </div>`;
+
+            $("body").append(panel);
+            if (!state.panelVisible) $("#ctrl-panel-container").hide();
+
+            $("#btn-start").click(start);
+            $("#btn-pause").click(pause);
+            $("#btn-reset").click(reset);
+            $("#btn-copy").click(copy);
+            $("#btn-skip").click(skipCurrent);
+            $("#acct-manage").click(openAccountSettings);
+            $("#btn-login-start").click(startLoginProcess);
+
+            const searchInput = document.getElementById('acct-search');
+            const dropdown = document.getElementById('acct-dropdown');
+            searchInput.addEventListener('focus', () => { renderDropdown(searchInput.value); dropdown.style.display = 'block'; });
+            searchInput.addEventListener('input', () => { renderDropdown(searchInput.value); dropdown.style.display = 'block'; });
+            document.addEventListener('click', (e) => {
+                if (!e.target.closest('#acct-search') && !e.target.closest('#acct-dropdown')) dropdown.style.display = 'none';
+            });
+
+            $("#chk-slow-internet").on("change", function () {
+                state.slowInternet = $(this).is(":checked");
+                persist();
+                log("Slow Internet Mode: " + (state.slowInternet ? "ON" : "OFF"));
+                toggleSkipButton();
+            });
+            $("#chk-link-method").on("change", function () {
+                state.linkMethod = $(this).is(":checked");
+                persist();
+                log("Link Method: " + (state.linkMethod ? "ON" : "OFF"));
+                toggleSkipButton();
+            });
+
+            restoreSelectedAccount();
+            updateTotal();
+            updateStatusDisplay();
+            startClock();
+            updateStepLabel();
+            toggleSkipButton();
+        }
+
+        function restoreSelectedAccount() {
+            const idx = getSelectedAccount();
+            const accounts = getAccounts();
+            const input = document.getElementById('acct-search');
+            if (input && idx !== null && idx >= 0 && idx < accounts.length) {
+                const acc = accounts[idx];
+                input.value = acc.name || acc.username || '';
+            }
+        }
+
+        function renderDropdown(filter) {
+            const dropdown = document.getElementById('acct-dropdown');
+            const accounts = getAccounts();
+            const q = String(filter || '').toLowerCase().trim();
+            const filtered = accounts.map((acc, i) => ({ ...acc, _idx: i }))
+                .filter(a => !q || (a.name || '').toLowerCase().includes(q) || (a.username || '').toLowerCase().includes(q));
+            dropdown.innerHTML = '';
+            if (filtered.length === 0) {
+                dropdown.innerHTML = '<div style="padding:8px;color:#888;font-style:italic;">No match</div>';
+                return;
+            }
+            filtered.forEach(acc => {
+                const row = document.createElement('div');
+                row.style.cssText = 'padding:6px 10px;cursor:pointer;border-bottom:1px solid #eee;';
+                row.innerHTML = `<div style="font-weight:bold;color:#333;">${acc.name || acc.username || '(no name)'}</div><div style="font-size:10px;color:#888;">${acc.username || ''} · ${acc.branchCode || ''}</div>`;
+                row.addEventListener('mouseenter', () => { row.style.background = '#e8f5e9'; });
+                row.addEventListener('mouseleave', () => { row.style.background = ''; });
+                row.addEventListener('click', () => {
+                    setSelectedAccount(acc._idx);
+                    document.getElementById('acct-search').value = acc.name || acc.username || '';
+                    dropdown.style.display = 'none';
+                    log('Selected: ' + (acc.name || acc.username));
+                });
+                dropdown.appendChild(row);
+            });
+        }
+
+        // ═══════════════════════════════════════════════════
+        // ACCOUNT SETTINGS MODAL
+        // ═══════════════════════════════════════════════════
+        function openAccountSettings() {
+            let modal = document.getElementById('mp-account-modal');
+            if (!modal) {
+                modal = document.createElement('div');
+                modal.id = 'mp-account-modal';
+                modal.style.cssText = 'display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);z-index:9999999;justify-content:center;align-items:center;font-family:Arial;';
+                modal.innerHTML = `
+                    <div style="background:#222;color:#fff;padding:20px;border-radius:10px;max-width:760px;width:95%;max-height:85vh;overflow:auto;">
+                        <h3 style="margin-top:0;color:#4CAF50;">⚙ Bulk Account Settings</h3>
+                        <div style="margin-bottom:6px;font-size:12px;color:#aaa;">Saved accounts:</div>
+                        <div id="mp-accounts-list" style="margin-bottom:12px;max-height:220px;overflow-y:auto;border:1px solid #333;padding:8px;border-radius:5px;"></div>
+                        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+                            <button id="mp-add-account" style="padding:6px 12px;background:#4CAF50;color:#fff;border:none;border-radius:5px;cursor:pointer;">+ Add One</button>
+                            <button id="mp-bulk-toggle" style="padding:6px 12px;background:#1976d2;color:#fff;border:none;border-radius:5px;cursor:pointer;">📋 Bulk Add</button>
+                            <button id="mp-remove-dup" style="padding:6px 12px;background:#ff9800;color:#fff;border:none;border-radius:5px;cursor:pointer;">🧹 Remove Duplicates</button>
+                            <button id="mp-clear-all" style="padding:6px 12px;background:#c33;color:#fff;border:none;border-radius:5px;cursor:pointer;">❌ Clear All Accounts</button>
+                        </div>
+                        <div id="mp-bulk-area" style="display:none;margin-bottom:14px;background:#1a1a1a;padding:10px;border-radius:6px;border:1px solid #333;">
+                            <div style="font-size:11px;color:#aaa;margin-bottom:6px;">
+                                Paste accounts – isa bawat linya (mula Excel, tab-separated).<br>
+                                <b>Format:</b> <code>name, username, password, branchcode</code><br>
+                                Auto-detect: tab (Excel) | pipe ( | ) | comma ( , ).<br>
+                                <b>BranchCode:</b> Any code (required).
+                            </div>
+                            <textarea id="mp-bulk-text" placeholder="Juan Dela Cruz	JDC001	pass123	TDTHA&#10;Maria Santos	MS002	pass456	MPLHA"
+                                style="width:100%;height:150px;background:#111;color:#fff;border:1px solid #444;border-radius:5px;padding:8px;font-family:monospace;font-size:12px;box-sizing:border-box;"></textarea>
+                            <div style="margin-top:8px;display:flex;gap:6px;">
+                                <button id="mp-bulk-import" style="padding:6px 12px;background:#4CAF50;color:#fff;border:none;border-radius:5px;cursor:pointer;">⬆ Import</button>
+                                <button id="mp-bulk-clear" style="padding:6px 12px;background:#666;color:#fff;border:none;border-radius:5px;cursor:pointer;">Clear Textarea</button>
+                            </div>
+                            <div id="mp-bulk-result" style="margin-top:8px;font-size:12px;"></div>
+                        </div>
+                        <hr style="margin:12px 0;border-color:#444;">
+                        <button id="mp-close-settings" style="padding:6px 12px;background:#666;color:#fff;border:none;border-radius:5px;cursor:pointer;">Close</button>
+                    </div>
+                `;
+                document.body.appendChild(modal);
+
+                document.getElementById('mp-add-account').addEventListener('click', () => {
+                    const a = getAccounts();
+                    a.push({ name: '', username: '', password: '', branchCode: '' });
+                    saveAccounts(a); renderAccountList();
+                });
+                document.getElementById('mp-bulk-toggle').addEventListener('click', () => {
+                    const area = document.getElementById('mp-bulk-area');
+                    area.style.display = area.style.display === 'none' ? 'block' : 'none';
+                });
+                document.getElementById('mp-bulk-clear').addEventListener('click', () => {
+                    document.getElementById('mp-bulk-text').value = '';
+                    document.getElementById('mp-bulk-result').innerHTML = '';
+                });
+                document.getElementById('mp-bulk-import').addEventListener('click', bulkImport);
+                document.getElementById('mp-remove-dup').addEventListener('click', () => {
+                    const accounts = getAccounts();
+                    const seen = new Set(); const unique = []; let removed = 0;
+                    for (const a of accounts) {
+                        const key = String(a.username || '').trim().toLowerCase();
+                        if (seen.has(key)) { removed++; continue; }
+                        seen.add(key); unique.push(a);
+                    }
+                    saveAccounts(unique); renderAccountList();
+                    alert(removed > 0 ? `Removed ${removed} duplicate(s).` : 'No duplicates found.');
+                });
+                document.getElementById('mp-clear-all').addEventListener('click', () => {
+                    if (!confirm('⚠️ Clear ALL accounts?\n\nThis cannot be undone.')) return;
+                    localStorage.removeItem(ACCOUNTS_KEY);
+                    localStorage.removeItem(SELECTED_ACCOUNT_KEY);
+                    renderAccountList();
+                    alert('✅ All accounts cleared.');
+                });
+                document.getElementById('mp-close-settings').addEventListener('click', () => {
+                    modal.style.display = 'none'; restoreSelectedAccount();
+                });
+            }
+            renderAccountList();
+            modal.style.display = 'flex';
+        }
+
+        function renderAccountList() {
+            const c = document.getElementById('mp-accounts-list');
+            if (!c) return;
+            const accounts = getAccounts();
+            c.innerHTML = '';
+            if (accounts.length === 0) { c.innerHTML = '<em style="color:#888;">No accounts saved</em>'; return; }
+            accounts.forEach((acc, i) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;gap:4px;margin-bottom:6px;align-items:center;';
+                row.innerHTML = `
+                    <span style="width:22px;color:#666;font-size:11px;">#${i + 1}</span>
+                    <input type="text" value="${(acc.name || '').replace(/"/g, '&quot;')}" data-field="name" data-index="${i}" placeholder="name" style="width:110px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;font-size:11px;">
+                    <input type="text" value="${(acc.username || '').replace(/"/g, '&quot;')}" data-field="username" data-index="${i}" placeholder="username" style="width:100px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;font-size:11px;">
+                    <input type="text" value="${(acc.password || '').replace(/"/g, '&quot;')}" data-field="password" data-index="${i}" placeholder="password" style="width:100px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;font-size:11px;">
+                    <input type="text" value="${(acc.branchCode || '').replace(/"/g, '&quot;')}" data-field="branchCode" data-index="${i}" placeholder="BRANCH" style="width:90px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;font-size:11px;text-transform:uppercase;">
+                    <button data-delete="${i}" style="padding:4px 6px;background:#c33;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">✕</button>
+                `;
+                c.appendChild(row);
+            });
+            c.querySelectorAll('input').forEach(el => {
+                el.addEventListener('change', function () {
+                    const idx = parseInt(this.dataset.index);
+                    const field = this.dataset.field;
+                    const a = getAccounts();
+                    let val = this.value;
+                    if (field === 'branchCode') val = val.toUpperCase().trim();
+                    a[idx][field] = val;
+                    saveAccounts(a);
+                });
+            });
+            c.querySelectorAll('button[data-delete]').forEach(btn => {
+                btn.addEventListener('click', function () {
+                    const idx = parseInt(this.dataset.delete);
+                    const a = getAccounts();
+                    a.splice(idx, 1); saveAccounts(a); renderAccountList();
+                });
+            });
+        }
+
+        function bulkImport() {
+            const text = document.getElementById('mp-bulk-text').value || '';
+            const resultEl = document.getElementById('mp-bulk-result');
+            if (!text.trim()) { resultEl.innerHTML = '<span style="color:#f44;">Empty input.</span>'; return; }
+
+            const lines = text.split(/\r\n|\r|\n/).map(s => s.trim()).filter(Boolean);
+            const accounts = getAccounts();
+            let added = 0, skippedDup = 0, skippedInvalid = 0, skippedHeader = 0, skippedNoBranch = 0;
+            const dupList = [], noBranchList = [];
+            const clean = (v) => String(v || '').replace(/^["'\s]+|["'\s]+$/g, '').trim();
+            const headerWords = ['name','username','user','password','pass','branch','branchcode','code','pwd'];
+
+            for (const rawLine of lines) {
+                let parts;
+                if (rawLine.includes('\t')) parts = rawLine.split('\t');
+                else if (rawLine.includes('|')) parts = rawLine.split('|');
+                else if (rawLine.includes(',')) parts = rawLine.split(',');
+                else parts = [rawLine];
+                parts = parts.map(clean);
+                while (parts.length && parts[parts.length - 1] === '') parts.pop();
+
+                const name = parts[0] || '';
+                const username = parts[1] || '';
+                const password = parts[2] || '';
+                let branchCode = (parts[3] || '').toUpperCase().trim();
+
+                if (headerWords.includes(name.toLowerCase())) { skippedHeader++; continue; }
+                if (!name && !username) { skippedInvalid++; continue; }
+                if (!branchCode) { skippedNoBranch++; noBranchList.push(username || name); continue; }
+                branchCode = branchCode.replace(/[^A-Z0-9\-]/g, '');
+                if (!branchCode) { skippedNoBranch++; noBranchList.push(username || name); continue; }
+
+                const dup = accounts.some(a => String(a.username || '').trim().toLowerCase() === username.toLowerCase() && username);
+                if (dup) { skippedDup++; dupList.push(username); continue; }
+
+                accounts.push({ name, username, password, branchCode });
+                added++;
+            }
+            saveAccounts(accounts); renderAccountList();
+
+            let msg = `<div style="color:#4CAF50;">✅ Added: <b>${added}</b></div>`;
+            if (skippedHeader > 0) msg += `<div style="color:#888;">ℹ Skipped header: <b>${skippedHeader}</b></div>`;
+            if (skippedNoBranch > 0) {
+                msg += `<div style="color:#f44;">❌ Missing branch: <b>${skippedNoBranch}</b>`;
+                if (noBranchList.length <= 5) msg += ` (${noBranchList.join(', ')})`;
+                msg += `</div>`;
+            }
+            if (skippedDup > 0) {
+                msg += `<div style="color:#ff9800;">⚠ Duplicates: <b>${skippedDup}</b>`;
+                if (dupList.length <= 5) msg += ` (${dupList.join(', ')})`;
+                msg += `</div>`;
+            }
+            if (skippedInvalid > 0) msg += `<div style="color:#f44;">❌ Invalid: <b>${skippedInvalid}</b></div>`;
+            resultEl.innerHTML = msg;
+            if (added > 0) document.getElementById('mp-bulk-text').value = '';
+        }
+
+        function startLoginProcess() {
+            const idx = getSelectedAccount();
+            if (idx === null) { alert('Please select an account first.'); return; }
+            const accounts = getAccounts();
+            if (idx < 0 || idx >= accounts.length) { alert('Selected account not found.'); return; }
+
+            const acc = accounts[idx];
+            if (!acc.branchCode || !String(acc.branchCode).trim()) {
+                alert('❌ Branch code required. Edit in ⚙ Manage Accounts.');
+                return;
+            }
+
+            clearLoginAttempts();
+            setAutoLogin(true);
+            applyAlertSuppression();
+
+            if (isOnLoginPage()) handleAutoLoginFlow();
+            else window.location.href = getLoginUrl();
+        }
+
+        // ═══════════════════════════════════════════════════
+        // STATUS / UI
+        // ═══════════════════════════════════════════════════
+        function updateStatusDisplay() {
+            $("#currentManifestLabel").text(state.currentManifest || '-');
+            let completed = state.completedManifests.length;
+            let total = completed;
+            if (state.linkMethod && state.linkQueue.length) total = state.linkQueue.length;
+            else total = completed + state.pendingManifests.length;
+            $("#progressLabel").text(completed + ' / ' + total);
+
+            let status = 'IDLE';
+            if (state.currentStep === 'SKIP') status = 'SKIPPING';
+            else if (state.currentStep === 'BACK1') status = 'BACK1 (loading)';
+            else if (state.currentStep === 'BACK2') status = 'BACK2 (to list)';
+            else if (state.currentStep === 'link_landing') status = 'LINK loading...';
+            else if (state.currentStep === 'link_extracting') status = 'LINK scanning...';
+            else if (state.currentStep === 'link_finish') status = 'LINK finishing...';
+            else if (state.currentStep) status = state.currentStep;
+            else if (state.processing) status = 'PROCESSING';
+            else status = 'PAUSED';
+            $("#statusLabel").text(status);
+        }
+
+        function toggleSkipButton() {
+            if (state.slowInternet || state.linkMethod) $("#btn-skip").show();
+            else $("#btn-skip").hide();
+        }
+
+        function updateStepLabel() { $("#stepLabel").text(state.currentStep || "IDLE"); }
+
+        function startClock() {
+            function updateClock() {
+                const now = new Date();
+                let hours = now.getHours();
+                const minutes = String(now.getMinutes()).padStart(2, "0");
+                const seconds = String(now.getSeconds()).padStart(2, "0");
+                const ampm = hours >= 12 ? "PM" : "AM";
+                hours = hours % 12 || 12;
+                const days = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+                const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+                $("#timeDisplay").text(`${hours}:${minutes}:${seconds} ${ampm}`);
+                $("#dateDisplay").text(`${days[now.getDay()]}, ${months[now.getMonth()]} ${now.getDate()}, ${now.getFullYear()}`);
+            }
+            updateClock();
+            setInterval(updateClock, 1000);
+        }
+
+        function log(m) {
+            const t = new Date().toLocaleTimeString();
+            $("#log").prepend(`[${t}] ${m}<br>`);
+            updateTotal(); updateStepLabel(); updateStatusDisplay();
+        }
+
+        function setStatus(t) {
+            const el = document.getElementById('statusLabel');
+            if (el) el.innerText = t;
+        }
+
+        function persist() {
+            Store.set(CONFIG.storageKey, JSON.stringify(state));
+            updateStatusDisplay();
+        }
+
+        function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
+        function getWaitTime() { return state.slowInternet ? CONFIG.slowMaxWaitTime : CONFIG.maxWaitTime; }
+
+        function waitFor(selector, timeout) {
+            return new Promise((resolve, reject) => {
+                const start = Date.now();
+                const i = setInterval(() => {
+                    if ($(selector).length) { clearInterval(i); resolve(); }
+                    if (Date.now() - start > timeout) { clearInterval(i); reject(new Error("Timeout: " + selector)); }
+                }, 300);
+            });
+        }
+
+        function waitUntilUnscanned() {
+            return new Promise((resolve, reject) => {
+                const start = Date.now();
+                const timeout = getWaitTime();
+                const i = setInterval(() => {
+                    const btn = $("#MainContent_lnktoggle");
+                    if (btn.length && btn.val() === "Unscanned Items") { clearInterval(i); resolve(); }
+                    if (Date.now() - start > timeout) { clearInterval(i); reject(new Error("Timeout: Unscanned")); }
+                }, 300);
+            });
+        }
+
+        function getCurrentUser() {
+            try { return $("#lblname b").first().text().trim() || "UNKNOWN"; }
+            catch (e) { return "UNKNOWN"; }
+        }
+
+        function updateTotal() {
+            const all = Store.get(CONFIG.dataStorageKey, "{}");
+            let total = 0;
+            try {
+                const parsed = JSON.parse(all);
+                Object.values(parsed).forEach((m) => (total += m.items ? m.items.length : 0));
+            } catch (e) {}
+            $("#totalDisplay").text("Total Items: " + total);
+        }
+
+        function countTRNRows() {
+            let count = 0;
+            $('tr').each(function () {
+                const tds = $(this).find('td:not(.displaynone)');
+                if (tds.length < 6) return;
+                const firstCell = tds.eq(0).text().trim();
+                if (/^\d{6,40}$/.test(firstCell)) count++;
+            });
+            return count;
+        }
+
+        function hasDataTable() { return countTRNRows() > 0; }
+
+        async function waitForStablePage(maxMs) {
+            maxMs = maxMs || 30000;
+            const start = Date.now();
+            let lastSig = '', stableCount = 0;
+            while (Date.now() - start < maxMs) {
+                const t = $("#MainContent_lnktoggle");
+                const label = t.length ? (t.val() || '').trim() : '';
+                const trnCount = countTRNRows();
+                const tableCount = document.querySelectorAll('table').length;
+                const ready = document.readyState === 'complete';
+                const sig = `${ready}|${label}|${trnCount}|${tableCount}`;
+                if (label !== '' && sig === lastSig) {
+                    stableCount++;
+                    if (stableCount >= 2) { log(`✅ Stable: label='${label}' rows=${trnCount}`); return true; }
+                } else { stableCount = 0; lastSig = sig; }
+                await delay(700);
+            }
+            log("⚠ Stability timeout");
+            return false;
+        }
+
+        function extract() {
+            const rows = [];
+            $('tr').each(function () {
+                const tds = $(this).find('td:not(.displaynone)');
+                if (tds.length < 6) return;
+                const firstCell = tds.eq(0).text().trim();
+                if (!/^\d{6,40}$/.test(firstCell)) return;
+                const cells = tds.map((i, td) => $(td).text().trim().replace(/\s+/g, " ")).get();
+                if (rows.some(r => r[0] === cells[0] && r[2] === cells[2])) return;
+                rows.push(cells);
+            });
+            return rows;
+        }
+
+        function saveLinkQueue(queue) { Store.set(CONFIG.queueBackupKey, JSON.stringify(queue)); }
+        function loadLinkQueue() {
+            try { const v = Store.get(CONFIG.queueBackupKey); return v ? JSON.parse(v) : []; }
+            catch (e) { return []; }
+        }
+        function clearLinkQueue() { Store.del(CONFIG.queueBackupKey); }
+
+        function extractManifestsWithUrls() {
+            const pathBase = location.pathname.replace(/\/[^/]*$/, '');
+            const baseUrl = location.origin + pathBase + '/PostingPerZone.aspx';
+            const manifests = [];
+            $('tr[onclick*="ShowEdit"]').each(function () {
+                const onclick = $(this).attr('onclick') || '';
+                const m = onclick.match(/ShowEdit\(([^)]+)\)/);
+                if (!m) return;
+                const args = m[1].split(',').map(s => s.trim().replace(/^['"]|['"]$/g, ''));
+                if (args.length < 10) return;
+                const url = baseUrl
+                    + '?manifestid=' + encodeURIComponent(args[0])
+                    + '&zone=' + encodeURIComponent(args[3])
+                    + '&zonedesc=' + encodeURIComponent(args[2]).replace(/%20/g, '+')
+                    + '&prodselect=' + encodeURIComponent(args[1]).replace(/%20/g, '+')
+                    + '&pdate=' + encodeURIComponent(args[4]).replace(/%2F/g, '%2f')
+                    + '&tat=' + encodeURIComponent(args[7])
+                    + '&delmode=' + encodeURIComponent(args[8]);
+                manifests.push({ manifestId: args[0], url });
+            });
+            return manifests;
+        }
+
+        function navigateToCurrentLink() {
+            if (state.linkIndex >= state.linkQueue.length) { finishLinkMethod(); return; }
+            const current = state.linkQueue[state.linkIndex];
+            state.currentManifest = current.manifestId;
+            state.currentStep = 'link_landing';
+            persist();
+            log(`Queue [${state.linkIndex + 1}/${state.linkQueue.length}] → ${current.manifestId}`);
+            window.location.href = current.url;
+        }
+
+        function isNoInternetPage() {
+            const bodyText = (document.body?.innerText || '').toLowerCase();
+            return bodyText.includes("no internet") || bodyText.includes("err_internet_disconnected") ||
+                   bodyText.includes("err_connection") || bodyText.includes("this site can't be reached") ||
+                   bodyText.includes("dns_probe") || (document.title || '').toLowerCase().includes('no internet');
+        }
+
+        function isLoadingTruckVisible() {
+            const imgs = document.querySelectorAll('img');
+            for (const img of imgs) {
+                const src = (img.src || '').toLowerCase();
+                if (src.includes('lbcs.png') || src.includes('loading') || src.includes('truck')) {
+                    if (img.offsetParent !== null) return true;
+                }
+            }
+            return document.querySelectorAll('table').length === 0 && !document.getElementById('lblname');
+        }
+
+        async function waitForLoadingScreenGone(maxMs) {
+            maxMs = maxMs || 60000;
+            const start = Date.now();
+            while (Date.now() - start < maxMs) {
+                if (isNoInternetPage()) { log("🌐 No Internet – waiting..."); await delay(3000); continue; }
+                if (!isLoadingTruckVisible()) return true;
+                await delay(1000);
+            }
+            return false;
+        }
+
+        async function processLinkManifest() {
+            state.currentStep = 'link_extracting';
+            persist();
+            log("▶ Link scan: " + state.currentManifest);
+
+            try {
+                if (isNoInternetPage()) { await delay(5000); if (isNoInternetPage()) { location.reload(); return; } }
+                await waitForLoadingScreenGone(90000);
+                if (isNoInternetPage()) { await delay(3000); location.reload(); return; }
+                await waitForStablePage(60000);
+
+                const toggle = $("#MainContent_lnktoggle");
+                const retryKey = 'linkRetryCount_' + state.currentManifest;
+                const clickedKey = 'linkToggleClicked_' + state.currentManifest;
+                const retryCount = parseInt(Store.get(retryKey) || '0');
+                const label = toggle.length ? (toggle.val() || "").trim() : "";
+                const trnCount = countTRNRows();
+                log(`Label: '${label}' | rows: ${trnCount} | retries: ${retryCount}/3`);
+
+                if (label === "Scanned Items") {
+                    if (retryCount >= 3) {
+                        Store.del(retryKey); Store.del(clickedKey);
+                        if (!state.completedManifests.includes(state.currentManifest)) state.completedManifests.push(state.currentManifest);
+                        state.linkIndex++; persist(); await delay(500); navigateToCurrentLink(); return;
+                    }
+                    Store.set(retryKey, retryCount + 1);
+                    Store.set(clickedKey, true);
+                    log(`🔁 Click toggle (retry ${retryCount + 1}/3)`);
+                    await delay(800);
+                    toggle.click();
+                    return;
+                }
+
+                if (label === "Unscanned Items") {
+                    log(`✅ Unscanned view – ${trnCount} rows`);
+                    if (trnCount === 0) {
+                        Store.del(retryKey); Store.del(clickedKey);
+                        if (!state.completedManifests.includes(state.currentManifest)) state.completedManifests.push(state.currentManifest);
+                        state.linkIndex++; persist(); await delay(500); navigateToCurrentLink(); return;
+                    }
+                    if (isNoInternetPage()) { await delay(3000); location.reload(); return; }
+                    const data = extract();
+                    const user = getCurrentUser();
+                    if (data.length === 0) {
+                        if (retryCount >= 3) {
+                            Store.del(retryKey); Store.del(clickedKey);
+                            if (!state.completedManifests.includes(state.currentManifest)) state.completedManifests.push(state.currentManifest);
+                            state.linkIndex++; persist(); await delay(500); navigateToCurrentLink(); return;
+                        }
+                        Store.set(retryKey, retryCount + 1);
+                        await delay(1500); location.reload(); return;
+                    }
+                    store(data, user);
+                    log("✅ Saved " + data.length + " items");
+                    Store.del(retryKey); Store.del(clickedKey);
+                    if (!state.completedManifests.includes(state.currentManifest)) state.completedManifests.push(state.currentManifest);
+                    state.linkIndex++; persist(); await delay(1000); navigateToCurrentLink();
+                    return;
+                }
+
+                if (retryCount >= 3) {
+                    Store.del(retryKey); Store.del(clickedKey);
+                    if (!state.completedManifests.includes(state.currentManifest)) state.completedManifests.push(state.currentManifest);
+                    state.linkIndex++; persist(); await delay(500); navigateToCurrentLink(); return;
+                }
+                Store.set(retryKey, retryCount + 1);
+                await delay(1500); location.reload();
+
+            } catch (e) {
+                log("❌ Error: " + e.message);
+                if (isNoInternetPage()) { await delay(3000); location.reload(); return; }
+                if (state.currentManifest && !state.completedManifests.includes(state.currentManifest)) state.completedManifests.push(state.currentManifest);
+                state.linkIndex++;
+                Store.del('linkRetryCount_' + state.currentManifest);
+                Store.del('linkToggleClicked_' + state.currentManifest);
+                persist(); await delay(1000); navigateToCurrentLink();
+            }
+        }
+
+        async function finishLinkMethod() {
+            log("🏁 Done → Posting: Per Zone");
+            state.processing = false;
+            state.currentStep = 'link_finish';
+            persist();
+            await delay(1500);
+            const btn = document.getElementById('LinkButton5');
+            if (btn) btn.click();
+            state.currentStep = null; state.currentManifest = null;
+            state.linkQueue = []; state.linkIndex = 0;
+            clearLinkQueue(); persist(); updateStatusDisplay();
+        }
+
+        function checkProcessingState() {
+            if (state.linkMethod && state.processing && (!state.linkQueue || state.linkQueue.length === 0)) {
+                const backup = loadLinkQueue();
+                if (backup && backup.length > 0) { state.linkQueue = backup; persist(); }
+            }
+            if (state.processing && state.linkMethod && (state.currentStep === 'link_landing' || state.currentStep === 'link_extracting')) {
+                if ($('#MainContent_lnktoggle').length > 0 || hasDataTable() || location.search.includes('manifestid=')) {
+                    processLinkManifest();
+                } else {
+                    setTimeout(() => {
+                        if (state.processing && state.linkMethod) {
+                            if ($('#MainContent_lnktoggle').length > 0 || hasDataTable() || location.search.includes('manifestid=')) processLinkManifest();
+                            else { state.processing = false; state.currentStep = null; persist(); }
+                        }
+                    }, 3000);
+                }
+                return;
+            }
+            if (state.currentStep === "SKIP") { handleSkip(); return; }
+            if (["BACK1", "BACK2"].includes(state.currentStep)) { handleReload(); }
+            else if (state.processing && state.currentManifest && !state.linkMethod) { setTimeout(() => execute(state.currentStep), 1000); }
+            else if (state.processing && !state.linkMethod) { nextManifest(); }
+        }
+
+        function start() {
+            if (state.processing) return;
+            state.processing = true;
+            state.stuckCount = 0;
+            if (state.linkMethod) {
+                const queue = extractManifestsWithUrls();
+                if (!queue.length) { alert("No manifests found."); state.processing = false; persist(); return; }
+                state.linkQueue = queue;
+                state.linkIndex = 0;
+                state.completedManifests = [];
+                saveLinkQueue(queue);
+                persist();
+                log("🚀 Link method – " + queue.length + " queued");
+                navigateToCurrentLink();
+            } else {
+                persist();
+                nextManifest();
+            }
+        }
+
+        function pause() { state.processing = false; persist(); log("⏸ Paused"); }
+
+        function reset() {
+            const keepSlow = state.slowInternet;
+            const keepLink = state.linkMethod;
+            state = JSON.parse(JSON.stringify(INITIAL_STATE));
+            state.slowInternet = keepSlow;
+            state.linkMethod = keepLink;
+            Store.del(CONFIG.storageKey);
+            Store.del(CONFIG.dataStorageKey);
+            clearLinkQueue();
+            clearLoginAttempts();
+            persist();
+            log("🔄 Reset");
+            updateTotal();
+            updateStatusDisplay();
+        }
+
+        function skipCurrent() {
+            if (state.currentManifest && !state.completedManifests.includes(state.currentManifest)) state.completedManifests.push(state.currentManifest);
+            if (state.linkMethod) {
+                Store.del('linkToggleClicked_' + state.currentManifest);
+                Store.del('linkRetryCount_' + state.currentManifest);
+                state.linkIndex++; persist(); navigateToCurrentLink(); return;
+            }
+            state.currentStep = "SKIP";
+            state.stuckCount = 0;
+            state.processing = true;
+            persist();
+            window.history.back();
+        }
+
+        async function handleSkip() {
+            try {
+                await waitFor('tr[onclick^="ShowEdit"]', 8000);
+                state.currentStep = null;
+                state.currentManifest = null;
+                state.stuckCount = 0;
+                persist();
+                nextManifest();
+            } catch {
+                state.currentStep = null;
+                persist();
+            }
+        }
+
+        function nextManifest() {
+            const all = $('tr[onclick^="ShowEdit"]').map((i, el) => $(el).find("td:eq(2)").text().trim()).get();
+            state.pendingManifests = all.filter((x) => !state.completedManifests.includes(x));
+            if (!state.pendingManifests.length) { state.processing = false; persist(); return; }
+            state.currentManifest = state.pendingManifests[0];
+            state.currentStep = "select_manifest";
+            state.stuckCount = 0;
+            persist();
+            const row = $(`tr[onclick^="ShowEdit"]:contains('${state.currentManifest}')`).first();
+            if (row.length) {
+                row.click();
+                setTimeout(() => execute("select_manifest"), 900);
+            }
+        }
+
+        async function execute(step) {
+            if (!state.processing) return;
+            await delay(state.slowInternet ? 400 : CONFIG.stepDelay);
+            updateStepLabel();
+            if (step === "select_manifest") return selectManifest();
+            if (step === "post_manifest") return postManifest();
+            if (step === "scan_items") return scanItems();
+        }
+
+        async function selectManifest() {
+            try {
+                await waitFor("#btnPost", getWaitTime());
+                state.currentStep = "post_manifest";
+                state.stuckCount = 0;
+                persist();
+                $("#btnPost").click();
+                await execute("post_manifest");
+            } catch { handleStuck("select_manifest"); }
+        }
+
+        async function postManifest() {
+            try {
+                await waitFor("#MainContent_lnktoggle", getWaitTime());
+                state.currentStep = "scan_items";
+                state.stuckCount = 0;
+                persist();
+                $("#MainContent_lnktoggle").click();
+                await waitUntilUnscanned();
+                await execute("scan_items");
+            } catch { handleStuck("post_manifest"); }
+        }
+
+        async function scanItems() {
+            try {
+                await waitFor('tr[style*="#990000"], tr', getWaitTime());
+                await delay(800);
+                const data = extract();
+                const user = getCurrentUser();
+                if (data.length > 0) store(data, user);
+                state.completedManifests.push(state.currentManifest);
+                state.currentStep = "BACK1";
+                state.stuckCount = 0;
+                persist();
+                window.history.back();
+            } catch {
+                state.completedManifests.push(state.currentManifest);
+                state.currentStep = "BACK1";
+                state.stuckCount = 0;
+                persist();
+                window.history.back();
+            }
+        }
+
+        function handleStuck(step) {
+            state.stuckCount = (state.stuckCount || 0) + 1;
+            if (state.stuckCount >= 3) {
+                state.completedManifests.push(state.currentManifest);
+                state.currentStep = "BACK1";
+                state.stuckCount = 0;
+                persist();
+                window.history.back();
+            } else { pause(); }
+        }
+
+        async function handleReload() {
+            try {
+                if (state.currentStep === "BACK1") {
+                    if (state.slowInternet) {
+                        state.currentStep = "BACK2";
+                        persist();
+                        window.history.back();
+                        const initUrl = location.href;
+                        setTimeout(() => { if (location.href === initUrl) try { window.history.go(-1); } catch(e) {} }, 3000);
+                        return;
+                    }
+                    await delay(1200);
+                    state.currentStep = "BACK2";
+                    persist();
+                    window.history.back();
+                    return;
+                }
+                if (state.currentStep === "BACK2") {
+                    const waitTime = state.slowInternet ? CONFIG.slowBack2Wait : CONFIG.maxWaitTime;
+                    try { await waitFor('tr[onclick^="ShowEdit"]', waitTime); } catch { }
+                    state.currentManifest = null;
+                    state.currentStep = null;
+                    state.stuckCount = 0;
+                    persist();
+                    nextManifest();
+                }
+            } catch { pause(); }
+        }
+
+        function store(items, user) {
+            let all = {};
+            try { all = JSON.parse(Store.get(CONFIG.dataStorageKey, "{}")); } catch (e) {}
+            all[state.currentManifest] = { user: user, items: items };
+            Store.set(CONFIG.dataStorageKey, JSON.stringify(all));
+            log("💾 Saved " + items.length + " items");
+        }
+
+        function copy() {
+            let allData = {};
+            try { allData = JSON.parse(Store.get(CONFIG.dataStorageKey, "{}")); } catch (e) {}
+            let normalTxt = "", trdTxt = "";
+            Object.values(allData).forEach((m) => {
+                if (!m || !Array.isArray(m.items)) return;
+                m.items.forEach((item) => {
+                    const hasTRD = item.some((cell) => /trd/i.test(String(cell || "")));
+                    const line = [...item, m.user || "UNKNOWN"].join("\t") + "\n";
+                    if (hasTRD) trdTxt += line;
+                    else normalTxt += line;
+                });
+            });
+            Store.clipboard(normalTxt + trdTxt);
+            log("📋 Copied");
+        }
+
+    } // end runMain
+
+    tryRun();
+})();
