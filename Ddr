@@ -1,0 +1,1133 @@
+// ==UserScript==
+// @name         LBC Full Auto – Auto All Once v27.1 (Date Wait Fix)
+// @namespace    http://tampermonkey.net/
+// @version      27.1
+// @description  DDR + Date Picker (waits for FULL load, applied before scan) + Any Branch + Reset stops all
+// @author       CAT & Butter
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+// ═══════════════════════════════════════════════════════════════
+// EARLY ANNOUNCEMENT REDIRECT
+// ═══════════════════════════════════════════════════════════════
+(function earlyAnnouncementRedirect() {
+    try {
+        if (localStorage.getItem('auto_all_once') !== 'true') return;
+        if (!location.href.includes('Announcement.aspx')) return;
+        const base = location.origin + location.pathname.replace(/\/[^/]*$/, '');
+        console.log('[LBC Early] Announcement → redirecting to DDR.aspx');
+        location.replace(base + '/DDR.aspx');
+    } catch (e) {}
+})();
+
+// ═══════════════════════════════════════════════════════════════
+// NUCLEAR ALERT LOCK
+// ═══════════════════════════════════════════════════════════════
+(function nuclearAlertLock() {
+    const autoMode = localStorage.getItem('auto_all_once') === 'true';
+    if (!autoMode) return;
+
+    const noop = () => undefined;
+    const yes  = () => true;
+    const nullFn = () => null;
+
+    function lockIn(w) {
+        if (!w) return;
+        try {
+            Object.defineProperty(w, 'alert', { value: noop, writable: false, configurable: false });
+            Object.defineProperty(w, 'confirm', { value: yes, writable: false, configurable: false });
+            Object.defineProperty(w, 'prompt', { value: nullFn, writable: false, configurable: false });
+        } catch (e) {}
+    }
+
+    lockIn(window);
+    try { if (typeof unsafeWindow !== 'undefined') lockIn(unsafeWindow); } catch (e) {}
+})();
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN SCRIPT
+// ═══════════════════════════════════════════════════════════════
+(function () {
+    'use strict';
+
+    let state_proc_stop = false;
+
+    const STORAGE_KEY = 'trn_scanner_records';
+    const LIST_KEY = 'manifest_list';
+    const INDEX_KEY = 'manifest_index';
+    const STATE_KEY = 'scanner_state';
+    const FLAG_RETURNED = 'returned_from_detail';
+    const MANIFEST_ID_KEY = 'current_manifest_id';
+    const MANIFEST_ZONE_KEY = 'current_manifest_zone';
+    const MANIFEST_DATETIME_KEY = 'current_manifest_datetime';
+    const SKIP_DUPLICATES_KEY = 'skip_duplicates';
+    const LINK_METHOD_KEY = 'link_method_enabled';
+    const AUTO_ALL_KEY = 'auto_all_once';
+    const ACCOUNTS_KEY = 'bulk_accounts';
+    const ACCOUNT_INDEX_KEY = 'bulk_account_index';
+    const CUSTOM_DATE_KEY = 'lbcfullauto_custom_date';
+
+    const getAccounts = () => { try { return JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '[]'); } catch { return []; } };
+    const saveAccounts = (a) => localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(a));
+    const getAccountIndex = () => parseInt(localStorage.getItem(ACCOUNT_INDEX_KEY) || '0');
+    const setAccountIndex = (i) => localStorage.setItem(ACCOUNT_INDEX_KEY, String(i));
+    const getAutoAll = () => localStorage.getItem(AUTO_ALL_KEY) === 'true';
+    const setAutoAll = (v) => localStorage.setItem(AUTO_ALL_KEY, v ? 'true' : 'false');
+    const getSkipDuplicates = () => localStorage.getItem(SKIP_DUPLICATES_KEY) !== 'false';
+    const setSkipDuplicates = (v) => localStorage.setItem(SKIP_DUPLICATES_KEY, v ? 'true' : 'false');
+    const getLinkMethod = () => localStorage.getItem(LINK_METHOD_KEY) === 'true';
+    const setLinkMethod = (v) => localStorage.setItem(LINK_METHOD_KEY, v ? 'true' : 'false');
+    const getCustomDate = () => localStorage.getItem(CUSTOM_DATE_KEY) || '';
+    const setCustomDate = (d) => {
+        if (d) localStorage.setItem(CUSTOM_DATE_KEY, d);
+        else localStorage.removeItem(CUSTOM_DATE_KEY);
+    };
+
+    const getBaseUrl = () => location.origin + location.pathname.replace(/\/[^/]*$/, '');
+    const getLoginUrl = () => getBaseUrl() + '/Login.aspx';
+    const getDdrUrl = () => getBaseUrl() + '/DDR.aspx';
+
+    function formatDateInput(dateStr) {
+        if (!dateStr) return '';
+        const parts = dateStr.split('-');
+        if (parts.length !== 3) return '';
+        const [y, m, d] = parts;
+        return `${parseInt(m, 10)}/${parseInt(d, 10)}/${y}`;
+    }
+    function todayInputValue() {
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = String(now.getMonth() + 1).padStart(2, '0');
+        const d = String(now.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    }
+
+    function setDdrDate(dateStr, triggerPostback) {
+        const field = document.getElementById('MainContent_txtddrdate');
+        if (!field) {
+            console.log('[LBC Date] Field not found');
+            return false;
+        }
+
+        const targetValue = dateStr ? formatDateInput(dateStr) : formatDateInput(todayInputValue());
+        console.log('[LBC Date] Setting:', targetValue, '| Current:', field.value);
+
+        try {
+            field.focus();
+            field.value = targetValue;
+            field.dispatchEvent(new Event('input', { bubbles: true }));
+            field.dispatchEvent(new Event('change', { bubbles: true }));
+            field.blur();
+        } catch (e) {}
+
+        if (triggerPostback) {
+            setTimeout(function() {
+                console.log('[LBC Date] 🚀 Triggering postback...');
+                try {
+                    if (typeof __doPostBack === 'function') {
+                        __doPostBack('ctl00$MainContent$txtddrdate', '');
+                        console.log('[LBC Date] ✅ __doPostBack called');
+                    } else if (field.form) {
+                        field.form.submit();
+                    }
+                } catch (e) {}
+            }, 200);
+        }
+        return true;
+    }
+
+    function waitForFullLoad() {
+        return new Promise(function(resolve) {
+            if (document.readyState === 'complete') {
+                resolve();
+            } else {
+                window.addEventListener('load', resolve, { once: true });
+            }
+        });
+    }
+
+    function dateNeedsApply() {
+        if (!location.href.includes('DDR.aspx')) return false;
+        const stored = getCustomDate();
+        if (!stored) return false;
+        const field = document.getElementById('MainContent_txtddrdate');
+        if (!field) return false;
+        const currentVal = (field.value || '').trim();
+        const targetVal = formatDateInput(stored);
+        return currentVal !== targetVal;
+    }
+
+    function applyAlertSuppression() {
+        if (!getAutoAll()) return;
+        const noop = () => undefined;
+        const yes = () => true;
+        const nullFn = () => null;
+
+        function tryLock(w) {
+            if (!w) return;
+            try {
+                const desc = Object.getOwnPropertyDescriptor(w, 'alert');
+                if (desc && desc.writable === false && desc.configurable === false) return;
+            } catch (e) {}
+            try {
+                Object.defineProperty(w, 'alert', { value: noop, writable: false, configurable: false });
+                Object.defineProperty(w, 'confirm', { value: yes, writable: false, configurable: false });
+                Object.defineProperty(w, 'prompt', { value: nullFn, writable: false, configurable: false });
+            } catch (e) {}
+        }
+
+        try { tryLock(window); } catch (e) {}
+        try { if (typeof unsafeWindow !== 'undefined') tryLock(unsafeWindow); } catch (e) {}
+    }
+
+    function onReady(fn) {
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn);
+        else fn();
+    }
+
+    onReady(function () {
+        try { applyAlertSuppression(); } catch (e) {}
+
+        const panel = document.createElement('div');
+        panel.innerHTML = `
+            <div style="font-weight:bold;margin-bottom:10px;">LBC FULL AUTO (v27.1)</div>
+            <button id="lbcfullauto-start">START</button>
+            <button id="lbcfullauto-pause">PAUSE</button>
+            <button id="lbcfullauto-copy">COPY</button>
+            <button id="lbcfullauto-reset">RESET</button>
+            <button id="lbcfullauto-settings">⚙ SETTINGS</button>
+
+            <div style="margin-top:12px;padding:10px;background:#e8f4ff;border:1px solid #90caf9;border-radius:6px;">
+                <div style="font-weight:bold;font-size:12px;color:#0d47a1;margin-bottom:6px;">
+                    📅 DDR Date of Transaction
+                </div>
+                <input type="date" id="lbcfullauto-date-picker"
+                    style="width:100%;padding:5px;box-sizing:border-box;border:1px solid #90caf9;border-radius:4px;font-size:12px;margin-bottom:6px;">
+                <div style="display:flex;gap:4px;">
+                    <button id="lbcfullauto-date-apply" style="flex:1;padding:5px;background:#1976d2;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">✔ Apply Date</button>
+                    <button id="lbcfullauto-date-reset" style="flex:1;padding:5px;background:#ff9800;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">↺ Today</button>
+                </div>
+                <div id="lbcfullauto-date-label" style="font-size:10px;color:#666;margin-top:5px;text-align:center;"></div>
+            </div>
+
+            <div style="margin-top:10px;">
+                <label><input type="checkbox" id="lbcfullauto-skip-duplicates" checked> Skip Duplicates</label>
+            </div>
+            <div style="margin-top:6px;">
+                <label><input type="checkbox" id="lbcfullauto-link-method"> Use Link Method (PrintDDR)</label>
+            </div>
+            <div style="margin-top:6px;">
+                <label><input type="checkbox" id="lbcfullauto-auto-all"> 🤖 Auto All Once</label>
+            </div>
+            <div id="lbcfullauto-status" style="margin-top:10px;font-size:12px;">Idle</div>
+            <div id="lbcfullauto-count" style="margin-top:5px;font-size:12px;">Records: 0</div>
+            <div style="margin-top:8px;font-size:11px;color:#aaa;">
+                Manifest | Date/Time | Zone | TRN | Product | Qty | Amount | Consignee | User
+            </div>
+        `;
+        Object.assign(panel.style, {
+            position: 'fixed', top: '20px', right: '20px', zIndex: '999999',
+            background: '#111', color: '#fff', padding: '12px',
+            borderRadius: '10px', width: '320px', fontSize: '13px',
+            boxShadow: '0 0 10px rgba(0,0,0,0.5)'
+        });
+        document.body.appendChild(panel);
+        panel.querySelectorAll('button').forEach(btn => {
+            Object.assign(btn.style, {
+                marginRight: '4px', marginBottom: '4px',
+                padding: '5px 8px', cursor: 'pointer', fontSize: '11px'
+            });
+        });
+
+        const datePicker = document.getElementById('lbcfullauto-date-picker');
+        const dateLabel = document.getElementById('lbcfullauto-date-label');
+
+        const savedDate = getCustomDate();
+        datePicker.value = savedDate || todayInputValue();
+
+        function updateDateLabel() {
+            const v = datePicker.value;
+            if (!v || v === todayInputValue()) {
+                dateLabel.textContent = `Using: Today (${formatDateInput(todayInputValue())})`;
+                dateLabel.style.color = '#666';
+                dateLabel.style.fontWeight = 'normal';
+            } else {
+                dateLabel.textContent = `Using: ${formatDateInput(v)}`;
+                dateLabel.style.color = '#0d47a1';
+                dateLabel.style.fontWeight = 'bold';
+            }
+        }
+        updateDateLabel();
+
+        document.getElementById('lbcfullauto-date-apply').addEventListener('click', async () => {
+            const v = datePicker.value;
+            if (!v) { alert('Please select a date first.'); return; }
+            setCustomDate(v);
+            updateDateLabel();
+
+            if (location.href.includes('DDR.aspx')) {
+                setStatus('⏳ Waiting for page to fully load...');
+                await waitForFullLoad();
+                await delay(1500);
+
+                const field = document.getElementById('MainContent_txtddrdate');
+                const currentVal = (field?.value || '').trim();
+                const targetVal = formatDateInput(v);
+                if (currentVal === targetVal) {
+                    setStatus(`✅ Date already ${targetVal} – no reload needed`);
+                    return;
+                }
+
+                setStatus(`📅 Applying date ${targetVal}...`);
+                setDdrDate(v, true);
+            } else {
+                setStatus('⚠ Not on DDR page – date will apply on next DDR load.');
+            }
+        });
+
+        document.getElementById('lbcfullauto-date-reset').addEventListener('click', async () => {
+            setCustomDate('');
+            datePicker.value = todayInputValue();
+            updateDateLabel();
+
+            if (location.href.includes('DDR.aspx')) {
+                setStatus('⏳ Waiting for page to fully load...');
+                await waitForFullLoad();
+                await delay(1500);
+
+                const field = document.getElementById('MainContent_txtddrdate');
+                const currentVal = (field?.value || '').trim();
+                const targetVal = formatDateInput(todayInputValue());
+                if (currentVal === targetVal) {
+                    setStatus(`✅ Already today – no reload needed`);
+                    return;
+                }
+
+                setStatus(`↺ Resetting to today...`);
+                setDdrDate('', true);
+            } else {
+                setStatus('↺ Reset to Today – will apply on DDR load.');
+            }
+        });
+
+        datePicker.addEventListener('change', updateDateLabel);
+
+        const modal = document.createElement('div');
+        modal.id = 'lbcfullauto-settings-modal';
+        modal.style.cssText = `display:none;position:fixed;top:0;left:0;width:100%;height:100%;
+            background:rgba(0,0,0,0.75);z-index:9999999;justify-content:center;align-items:center;font-family:Arial;`;
+        modal.innerHTML = `
+            <div style="background:#222;color:#fff;padding:20px;border-radius:10px;
+                max-width:760px;width:95%;max-height:85vh;overflow:auto;">
+                <h3 style="margin-top:0;color:#4CAF50;">⚙ Bulk Account Settings</h3>
+
+                <div style="margin-bottom:6px;font-size:12px;color:#aaa;">Saved accounts:</div>
+                <div id="lbcfullauto-accounts-list" style="margin-bottom:12px;
+                    max-height:200px;overflow-y:auto;border:1px solid #333;padding:8px;border-radius:5px;"></div>
+
+                <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+                    <button id="lbcfullauto-add-account"
+                        style="padding:6px 12px;background:#4CAF50;color:#fff;border:none;border-radius:5px;cursor:pointer;">
+                        + Add One
+                    </button>
+                    <button id="lbcfullauto-bulk-toggle"
+                        style="padding:6px 12px;background:#1976d2;color:#fff;border:none;border-radius:5px;cursor:pointer;">
+                        📋 Bulk Add
+                    </button>
+                    <button id="lbcfullauto-remove-dup"
+                        style="padding:6px 12px;background:#ff9800;color:#fff;border:none;border-radius:5px;cursor:pointer;">
+                        🧹 Remove Duplicates
+                    </button>
+                    <button id="lbcfullauto-clear-all"
+                        style="padding:6px 12px;background:#c33;color:#fff;border:none;border-radius:5px;cursor:pointer;">
+                        ❌ Clear All Accounts
+                    </button>
+                </div>
+
+                <div id="lbcfullauto-bulk-area" style="display:none;margin-bottom:14px;
+                    background:#1a1a1a;padding:10px;border-radius:6px;border:1px solid #333;">
+                    <div style="font-size:11px;color:#aaa;margin-bottom:6px;">
+                        Paste accounts – isa bawat linya. Pwede mula Excel (tab‑separated).<br>
+                        Format: <code>username,password,branchCode</code><br>
+                        Auto‑detect separator: tab (Excel), pipe ( | ), o comma ( , ).<br>
+                        BranchCode: Any code (required).
+                    </div>
+                    <textarea id="lbcfullauto-bulk-text" placeholder="HARVEY001	pass123	TDTHA&#10;HARVEY002	pass456	MPLHA"
+                        style="width:100%;height:140px;background:#111;color:#fff;border:1px solid #444;
+                        border-radius:5px;padding:8px;font-family:monospace;font-size:12px;box-sizing:border-box;"></textarea>
+                    <div style="margin-top:8px;display:flex;gap:6px;">
+                        <button id="lbcfullauto-bulk-import"
+                            style="padding:6px 12px;background:#4CAF50;color:#fff;border:none;border-radius:5px;cursor:pointer;">
+                            ⬆ Import
+                        </button>
+                        <button id="lbcfullauto-bulk-clear"
+                            style="padding:6px 12px;background:#666;color:#fff;border:none;border-radius:5px;cursor:pointer;">
+                            Clear Textarea
+                        </button>
+                    </div>
+                    <div id="lbcfullauto-bulk-result" style="margin-top:8px;font-size:12px;"></div>
+                </div>
+
+                <hr style="margin:12px 0;border-color:#444;">
+                <button id="lbcfullauto-close-settings"
+                    style="padding:6px 12px;background:#666;color:#fff;border:none;border-radius:5px;cursor:pointer;">
+                    Close
+                </button>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        function isDuplicateAccount(list, username, password, branchCode, ignoreIndex = -1) {
+            const u = String(username || '').trim().toLowerCase();
+            const b = String(branchCode || '').trim().toUpperCase();
+            if (!u) return false;
+            return list.some((a, i) => {
+                if (i === ignoreIndex) return false;
+                return String(a.username || '').trim().toLowerCase() === u &&
+                       String(a.branchCode || '').trim().toUpperCase() === b;
+            });
+        }
+
+        function removeDuplicates() {
+            const accounts = getAccounts();
+            const seen = new Set();
+            const unique = [];
+            let removed = 0;
+            for (const a of accounts) {
+                if (!a.username || !a.username.trim()) { unique.push(a); continue; }
+                const key = String(a.username || '').trim().toLowerCase() + '||' +
+                            String(a.branchCode || '').trim().toUpperCase();
+                if (seen.has(key)) { removed++; continue; }
+                seen.add(key);
+                unique.push(a);
+            }
+            saveAccounts(unique);
+            renderAccounts();
+            return removed;
+        }
+
+        function renderAccounts() {
+            const c = document.getElementById('lbcfullauto-accounts-list');
+            const accounts = getAccounts();
+            c.innerHTML = '';
+            if (accounts.length === 0) {
+                c.innerHTML = '<em style="color:#888;">No accounts saved</em>';
+                return;
+            }
+            accounts.forEach((acc, i) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;gap:5px;margin-bottom:6px;align-items:center;';
+                row.innerHTML = `
+                    <span style="width:22px;color:#666;font-size:11px;">#${i + 1}</span>
+                    <input type="text" value="${(acc.username || '').replace(/"/g, '&quot;')}"
+                        data-field="username" data-index="${i}" placeholder="username"
+                        style="width:110px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;">
+                    <input type="text" value="${(acc.password || '').replace(/"/g, '&quot;')}"
+                        data-field="password" data-index="${i}" placeholder="password"
+                        style="width:110px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;">
+                    <input type="text" value="${(acc.branchCode || '').replace(/"/g, '&quot;')}"
+                        data-field="branchCode" data-index="${i}" placeholder="BRANCH"
+                        style="width:90px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;text-transform:uppercase;">
+                    <button data-delete="${i}" title="Delete"
+                        style="padding:4px 8px;background:#c33;color:#fff;border:none;border-radius:3px;cursor:pointer;">✕</button>
+                `;
+                c.appendChild(row);
+            });
+            c.querySelectorAll('input').forEach(el => {
+                el.addEventListener('change', function () {
+                    const idx = parseInt(this.dataset.index);
+                    const field = this.dataset.field;
+                    const accounts = getAccounts();
+                    let val = this.value;
+                    if (field === 'branchCode') val = val.toUpperCase().trim();
+                    accounts[idx][field] = val;
+                    saveAccounts(accounts);
+                });
+            });
+            c.querySelectorAll('button[data-delete]').forEach(btn => {
+                btn.addEventListener('click', function () {
+                    const idx = parseInt(this.dataset.delete);
+                    const a = getAccounts();
+                    a.splice(idx, 1);
+                    saveAccounts(a);
+                    renderAccounts();
+                });
+            });
+        }
+
+        document.getElementById('lbcfullauto-settings').addEventListener('click', () => {
+            renderAccounts();
+            modal.style.display = 'flex';
+        });
+        document.getElementById('lbcfullauto-close-settings').addEventListener('click', () => {
+            modal.style.display = 'none';
+        });
+
+        document.getElementById('lbcfullauto-add-account').addEventListener('click', () => {
+            const a = getAccounts();
+            a.push({ username: '', password: '', branchCode: '' });
+            saveAccounts(a);
+            renderAccounts();
+        });
+
+        document.getElementById('lbcfullauto-bulk-toggle').addEventListener('click', () => {
+            const area = document.getElementById('lbcfullauto-bulk-area');
+            area.style.display = area.style.display === 'none' ? 'block' : 'none';
+        });
+
+        document.getElementById('lbcfullauto-bulk-clear').addEventListener('click', () => {
+            document.getElementById('lbcfullauto-bulk-text').value = '';
+            document.getElementById('lbcfullauto-bulk-result').innerHTML = '';
+        });
+
+        document.getElementById('lbcfullauto-clear-all').addEventListener('click', () => {
+            if (!confirm('⚠️ Clear ALL accounts?\n\nThis cannot be undone.')) return;
+            localStorage.removeItem(ACCOUNTS_KEY);
+            localStorage.removeItem(ACCOUNT_INDEX_KEY);
+            renderAccounts();
+            alert('✅ All accounts cleared.');
+        });
+
+        function looksLikeHeader(u, p, b) {
+            const lower = [u, p, b].map(x => String(x || '').toLowerCase().trim());
+            const headerWords = ['username','user','userid','user name','password','pass','pwd',
+                                 'branch','branchcode','branch code','code','name'];
+            return lower.some(x => headerWords.includes(x));
+        }
+        function cleanCellInput(v) {
+            return String(v || '').replace(/^["'\s]+|["'\s]+$/g, '').trim();
+        }
+
+        document.getElementById('lbcfullauto-bulk-import').addEventListener('click', () => {
+            const text = document.getElementById('lbcfullauto-bulk-text').value || '';
+            const resultEl = document.getElementById('lbcfullauto-bulk-result');
+            if (!text.trim()) {
+                resultEl.innerHTML = '<span style="color:#f44;">Empty input.</span>';
+                return;
+            }
+
+            const lines = text.split(/\r\n|\r|\n/).map(s => s.trim()).filter(Boolean);
+            const accounts = getAccounts();
+            let added = 0, skippedDup = 0, skippedInvalid = 0, skippedHeader = 0, skippedNoBranch = 0;
+            const dupList = [], noBranchList = [];
+
+            for (const rawLine of lines) {
+                let parts;
+                if (rawLine.includes('\t')) parts = rawLine.split('\t');
+                else if (rawLine.includes('|')) parts = rawLine.split('|');
+                else if (rawLine.includes(',')) parts = rawLine.split(',');
+                else parts = [rawLine];
+
+                parts = parts.map(cleanCellInput);
+                while (parts.length && parts[parts.length - 1] === '') parts.pop();
+
+                const username = parts[0] || '';
+                const password = parts[1] || '';
+                let branchCode = (parts[2] || '').toUpperCase().trim();
+
+                if (looksLikeHeader(username, password, branchCode)) { skippedHeader++; continue; }
+                if (!username) { skippedInvalid++; continue; }
+                if (!branchCode) { skippedNoBranch++; noBranchList.push(username); continue; }
+
+                branchCode = branchCode.replace(/[^A-Z0-9\-]/g, '');
+                if (!branchCode) { skippedNoBranch++; noBranchList.push(username); continue; }
+
+                if (isDuplicateAccount(accounts, username, password, branchCode)) {
+                    skippedDup++;
+                    dupList.push(`${username} / ${branchCode}`);
+                    continue;
+                }
+
+                accounts.push({ username, password, branchCode });
+                added++;
+            }
+
+            saveAccounts(accounts);
+            renderAccounts();
+
+            let msg = `<div style="color:#4CAF50;">✅ Added: <b>${added}</b></div>`;
+            if (skippedHeader > 0) msg += `<div style="color:#888;">ℹ Skipped header row(s): <b>${skippedHeader}</b></div>`;
+            if (skippedNoBranch > 0) {
+                msg += `<div style="color:#f44;">❌ Missing branch code: <b>${skippedNoBranch}</b>`;
+                if (noBranchList.length <= 5) msg += ` (${noBranchList.join(', ')})`;
+                msg += `</div>`;
+            }
+            if (skippedDup > 0) {
+                msg += `<div style="color:#ff9800;">⚠ Skipped duplicates: <b>${skippedDup}</b>`;
+                if (dupList.length <= 5) msg += ` (${dupList.join(', ')})`;
+                msg += `</div>`;
+            }
+            if (skippedInvalid > 0) msg += `<div style="color:#f44;">❌ Invalid lines: <b>${skippedInvalid}</b></div>`;
+            resultEl.innerHTML = msg;
+
+            if (added > 0) document.getElementById('lbcfullauto-bulk-text').value = '';
+        });
+
+        document.getElementById('lbcfullauto-remove-dup').addEventListener('click', () => {
+            const removed = removeDuplicates();
+            if (removed > 0) alert(`Removed ${removed} duplicate account(s).`);
+            else alert('No duplicates found.');
+        });
+
+        function setStatus(t) {
+            const el = document.getElementById('lbcfullauto-status');
+            if (el) el.innerText = t;
+        }
+        function getStoredRecords() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; } }
+        function setStoredRecords(r) { localStorage.setItem(STORAGE_KEY, JSON.stringify(r)); }
+        function updateCount() {
+            const el = document.getElementById('lbcfullauto-count');
+            if (el) el.innerText = `Records: ${getStoredRecords().length}`;
+        }
+        const delay = (ms) => new Promise(r => setTimeout(r, ms));
+        const getUsername = () => {
+            const el = document.querySelector('#lblname b');
+            return el ? el.innerText?.trim() : 'UNKNOWN_USER';
+        };
+
+        function cleanCell(cell) {
+            if (!cell) return '';
+            return String(cell.innerText || cell.textContent || '')
+                .replace(/[\r\n]+/g, ' ')
+                .replace(/\t+/g, ' ')
+                .replace(/\|/g, '/')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        function getColumnIndex(text) {
+            for (const td of document.querySelectorAll('td')) {
+                const t = td.innerText?.trim();
+                if (!t) continue;
+                if (t.toLowerCase().replace(/\s+/g, ' ') === text.toLowerCase().replace(/\s+/g, ' ')) {
+                    const tr = td.parentElement;
+                    if (tr) return Array.from(tr.children).indexOf(td);
+                }
+            }
+            return -1;
+        }
+        function getFirstTRNOnPage() {
+            const idx = getColumnIndex('Tracking Number');
+            if (idx === -1) return null;
+            for (const row of document.querySelectorAll('tr')) {
+                const cells = row.querySelectorAll('td');
+                if (!cells || cells.length <= idx) continue;
+                const t = cells[idx]?.innerText?.trim() || '';
+                const d = t.replace(/\D/g, '');
+                if (d.length >= 6 && d.length <= 20) return d;
+            }
+            return null;
+        }
+        function extractTRN(cell) {
+            if (!cell) return null;
+            const t = cell.innerText?.trim() || '';
+            const d = t.replace(/\D/g, '');
+            if (d.length >= 6 && d.length <= 20) return d;
+            const r = cell.textContent?.trim() || '';
+            const rd = r.replace(/\D/g, '');
+            if (rd.length >= 6 && rd.length <= 20) return rd;
+            return null;
+        }
+        function getNextButton() {
+            return document.querySelector('#ctl00_MainContent_ReportViewer1_ctl05_ctl00_Next_ctl00_ctl00')
+                || document.querySelector('input[id*="Next"]');
+        }
+        function isNextDisabled(btn) {
+            if (!btn) return true;
+            if (btn.disabled) return true;
+            const src = btn.src || '';
+            if (src.includes('Disabled') || src.includes('disabled')) return true;
+            const st = window.getComputedStyle(btn);
+            if (st.pointerEvents === 'none') return true;
+            if (parseFloat(st.opacity) < 0.5) return true;
+            return false;
+        }
+        async function waitForPageChange(oldTRN) {
+            const s = Date.now();
+            while (Date.now() - s < 15000) {
+                await delay(1000);
+                const cur = getFirstTRNOnPage();
+                if (cur && cur !== oldTRN) { await delay(1500); return true; }
+            }
+            return false;
+        }
+        async function waitForDetailReady(t = 25000) {
+            const s = Date.now();
+            while (Date.now() - s < t) {
+                if (getColumnIndex('Tracking Number') !== -1) return true;
+                await delay(500);
+            }
+            return false;
+        }
+
+        function extractPageDataWithMetadata(manifestId, zone, dateTime) {
+            const username = getUsername();
+            const idxTRN = getColumnIndex('Tracking Number');
+            const idxProduct = getColumnIndex('Product');
+            const idxQty = getColumnIndex('Qty');
+            const idxAmount = getColumnIndex('Amount(Php)');
+            const idxConsignee = getColumnIndex("Consignee's Name");
+            if (idxTRN === -1) return 0;
+            const skipDup = getSkipDuplicates();
+            let added = 0;
+            const stored = getStoredRecords();
+            let existing = new Set();
+            if (skipDup) existing = new Set(stored.map(r => r.trn));
+            for (const row of document.querySelectorAll('tr')) {
+                const cells = row.querySelectorAll('td');
+                if (!cells || cells.length <= Math.max(idxTRN, idxProduct, idxQty, idxAmount, idxConsignee)) continue;
+                const trn = extractTRN(cells[idxTRN]);
+                if (!trn) continue;
+                if (skipDup && existing.has(trn)) continue;
+                stored.push({
+                    manifest: manifestId, dateTime, zone, trn,
+                    product:   (idxProduct   !== -1 && cells.length > idxProduct)   ? cleanCell(cells[idxProduct])   : '',
+                    qty:       (idxQty       !== -1 && cells.length > idxQty)       ? cleanCell(cells[idxQty])       : '',
+                    amount:    (idxAmount    !== -1 && cells.length > idxAmount)    ? cleanCell(cells[idxAmount])    : '',
+                    consignee: (idxConsignee !== -1 && cells.length > idxConsignee) ? cleanCell(cells[idxConsignee]) : '',
+                    username
+                });
+                if (skipDup) existing.add(trn);
+                added++;
+            }
+            if (added > 0) { setStoredRecords(stored); updateCount(); }
+            return added;
+        }
+        function extractManifestList() {
+            const base = getBaseUrl() + '/PrintDDR.aspx';
+            const manifests = [];
+            for (const row of document.querySelectorAll('tr[onclick*="ShowDDR"]')) {
+                const onclick = row.getAttribute('onclick') || '';
+                const m = onclick.match(/ShowDDR\(([^)]+)\)/);
+                if (!m) continue;
+                const args = m[1].split(',').map(s => s.trim().replace(/^['"]|['"]$/g, ''));
+                if (args.length < 9) continue;
+                const url = base + '?manifestid=' + encodeURIComponent(args[0]) + '&prodselect=' + encodeURIComponent(args[1]);
+                manifests.push({ manifestId: args[0], zone: args[2], dateTime: args[7], url });
+            }
+            return manifests;
+        }
+
+        async function waitForElement(sel, t = 20000) {
+            const s = Date.now();
+            while (Date.now() - s < t) {
+                if (document.querySelector(sel)) return true;
+                await delay(300);
+            }
+            return false;
+        }
+        const isOnLoginPage = () => location.href.includes('Login.aspx') || !!document.getElementById('MainContent_txtusername');
+        const isOnDdrPage = () => location.href.includes('DDR.aspx') || !!document.querySelector('tr[onclick*="ShowDDR"]');
+
+        async function processLogin() {
+            if (state_proc_stop) return;
+            const accounts = getAccounts();
+            const idx = getAccountIndex();
+            if (idx >= accounts.length) {
+                setStatus('✅ All accounts processed!');
+                setAutoAll(false);
+                document.getElementById('lbcfullauto-auto-all').checked = false;
+                setAccountIndex(0);
+                localStorage.setItem(STATE_KEY, 'IDLE');
+                return;
+            }
+            const acc = accounts[idx];
+            setStatus(`🔐 Login ${idx + 1}/${accounts.length}: ${acc.username}`);
+
+            const ready = await waitForElement('#MainContent_txtusername', 20000);
+            if (!ready) {
+                setStatus('⚠ Login page not ready');
+                setAccountIndex(idx + 1);
+                localStorage.setItem(STATE_KEY, 'LOGIN');
+                await processLogin();
+                return;
+            }
+
+            applyAlertSuppression();
+
+            document.getElementById('MainContent_txtusername').value = acc.username;
+            document.getElementById('MainContent_txtpassword').value = acc.password;
+            document.getElementById('MainContent_txtbranchcode').value = acc.branchCode;
+
+            await delay(400);
+            setStatus('🔐 Submitting login...');
+            document.getElementById('MainContent_btnLogin').click();
+            localStorage.setItem(STATE_KEY, 'POST_LOGIN');
+        }
+
+        async function handlePostLogin() {
+            if (state_proc_stop) return;
+            applyAlertSuppression();
+            await delay(1200);
+
+            if (isOnLoginPage()) {
+                setStatus('⚠ Still on login – wrong credentials? Next account...');
+                setAccountIndex(getAccountIndex() + 1);
+                localStorage.setItem(STATE_KEY, 'LOGIN');
+                await processLogin();
+                return;
+            }
+
+            if (isOnDdrPage()) {
+                setStatus('✅ On DDR → preparing to scan');
+                localStorage.removeItem(LIST_KEY);
+                localStorage.removeItem(INDEX_KEY);
+                localStorage.removeItem(FLAG_RETURNED);
+                localStorage.setItem(STATE_KEY, 'LIST');
+                await processList();
+                return;
+            }
+
+            setStatus('⚡ Forcing to DDR.aspx...');
+            window.location.replace(getDdrUrl());
+        }
+
+        async function handleLogout() {
+            if (state_proc_stop) return;
+            if (isOnLoginPage()) {
+                const nextIdx = getAccountIndex() + 1;
+                const accounts = getAccounts();
+                if (nextIdx >= accounts.length) {
+                    setStatus('✅ All accounts processed!');
+                    setAutoAll(false);
+                    document.getElementById('lbcfullauto-auto-all').checked = false;
+                    setAccountIndex(0);
+                    localStorage.setItem(STATE_KEY, 'IDLE');
+                    return;
+                }
+                setAccountIndex(nextIdx);
+                localStorage.setItem(STATE_KEY, 'LOGIN');
+                await processLogin();
+                return;
+            }
+            setStatus('🚪 Logging out...');
+            applyAlertSuppression();
+            const logout = document.getElementById('LinkButton1');
+            if (logout) {
+                logout.click();
+                setTimeout(() => {
+                    if (!location.href.includes('Login.aspx')) {
+                        window.location.href = getLoginUrl();
+                    }
+                }, 5000);
+            } else {
+                window.location.href = getLoginUrl();
+            }
+        }
+
+        async function processList() {
+            if (state_proc_stop) return;
+
+            // WAIT FOR FULL LOAD + APPLY DATE IF NEEDED
+            if (isOnDdrPage()) {
+                setStatus('⏳ Waiting for page to fully load...');
+                await waitForFullLoad();
+                await delay(1500);
+
+                if (state_proc_stop) return;
+
+                if (dateNeedsApply()) {
+                    const stored = getCustomDate();
+                    const targetVal = formatDateInput(stored);
+                    console.log('[LBC Date] ⚠ Date mismatch – applying BEFORE scan:', targetVal);
+                    setStatus(`📅 Applying date ${targetVal}...`);
+                    setDdrDate(stored, true);
+                    return;
+                } else {
+                    const stored = getCustomDate();
+                    if (stored) {
+                        console.log('[LBC Date] ✅ Date confirmed:', formatDateInput(stored));
+                    }
+                }
+            }
+
+            if (state_proc_stop) return;
+
+            let manifests;
+            try { manifests = JSON.parse(localStorage.getItem(LIST_KEY) || '[]'); }
+            catch { manifests = []; }
+
+            if (manifests.length === 0) {
+                manifests = extractManifestList();
+                if (manifests.length === 0) {
+                    setStatus('⚠ No manifests. Logging out to next account...');
+                    localStorage.setItem(STATE_KEY, 'LOGOUT');
+                    await handleLogout();
+                    return;
+                }
+                localStorage.setItem(LIST_KEY, JSON.stringify(manifests));
+                localStorage.setItem(INDEX_KEY, '0');
+                setStatus(`Found ${manifests.length} manifests.`);
+            }
+
+            let index = parseInt(localStorage.getItem(INDEX_KEY) || '0');
+            const total = manifests.length;
+
+            if (localStorage.getItem(FLAG_RETURNED) === 'true') {
+                localStorage.removeItem(FLAG_RETURNED);
+                index++;
+                localStorage.setItem(INDEX_KEY, index.toString());
+            }
+
+            if (index >= total) {
+                setStatus('All manifests done for this account.');
+                localStorage.removeItem(LIST_KEY);
+                localStorage.removeItem(INDEX_KEY);
+                if (getAutoAll()) {
+                    localStorage.setItem(STATE_KEY, 'LOGOUT');
+                    await delay(1200);
+                    await handleLogout();
+                    return;
+                }
+                localStorage.setItem(STATE_KEY, 'IDLE');
+                return;
+            }
+
+            const m = manifests[index];
+            setStatus(`📦 [${index + 1}/${total}] ${m.manifestId}`);
+
+            localStorage.setItem(MANIFEST_ID_KEY, m.manifestId);
+            localStorage.setItem(MANIFEST_ZONE_KEY, m.zone);
+            localStorage.setItem(MANIFEST_DATETIME_KEY, m.dateTime);
+
+            if (getLinkMethod()) {
+                localStorage.setItem(STATE_KEY, 'DETAIL');
+                window.location.href = m.url;
+                return;
+            }
+
+            const rows = document.querySelectorAll('tr[onclick*="ShowDDR"]');
+            let targetRow = null;
+            for (const row of rows) {
+                if (row.getAttribute('onclick').includes(m.manifestId)) { targetRow = row; break; }
+            }
+            if (!targetRow) {
+                setStatus('Row not found. Skipping...');
+                localStorage.setItem(STATE_KEY, 'LIST');
+                await processList();
+                return;
+            }
+            targetRow.click();
+            await delay(500);
+            let btn = null;
+            for (let t = 0; t < 20; t++) {
+                await delay(500);
+                btn = document.getElementById('btnPrintPost');
+                if (btn && btn.style.display !== 'none') break;
+            }
+            if (btn) {
+                localStorage.setItem(STATE_KEY, 'DETAIL');
+                btn.click();
+            } else {
+                setStatus('Print button not found.');
+                localStorage.setItem(STATE_KEY, 'IDLE');
+            }
+        }
+
+        async function processDetail() {
+            if (state_proc_stop) return;
+            applyAlertSuppression();
+            const manifestId = localStorage.getItem(MANIFEST_ID_KEY);
+            const zone = localStorage.getItem(MANIFEST_ZONE_KEY) || '';
+            const dateTime = localStorage.getItem(MANIFEST_DATETIME_KEY) || '';
+            if (!manifestId) {
+                setStatus('No manifest ID.');
+                localStorage.setItem(STATE_KEY, 'IDLE');
+                return;
+            }
+            setStatus(`⏳ Waiting detail ${manifestId}...`);
+            const ready = await waitForDetailReady(25000);
+            if (!ready) {
+                setStatus('⚠ Detail timeout');
+                localStorage.setItem(FLAG_RETURNED, 'true');
+                localStorage.setItem(STATE_KEY, 'LIST');
+                await processList();
+                return;
+            }
+            setStatus(`🔍 Scanning ${manifestId}...`);
+            let totalAdded = 0, pages = 0;
+            while (true) {
+                if (state_proc_stop) return;
+                pages++;
+                totalAdded += extractPageDataWithMetadata(manifestId, zone, dateTime);
+                const nextBtn = getNextButton();
+                if (!nextBtn || isNextDisabled(nextBtn)) break;
+                const oldTRN = getFirstTRNOnPage();
+                nextBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                await delay(1000);
+                const changed = await waitForPageChange(oldTRN);
+                if (!changed) break;
+            }
+            setStatus(`✅ ${manifestId} – ${totalAdded} records / ${pages} pages`);
+            localStorage.removeItem(MANIFEST_ID_KEY);
+            localStorage.removeItem(MANIFEST_ZONE_KEY);
+            localStorage.removeItem(MANIFEST_DATETIME_KEY);
+            localStorage.setItem(FLAG_RETURNED, 'true');
+            localStorage.setItem(STATE_KEY, 'LIST');
+
+            if (getLinkMethod()) {
+                await delay(500);
+                await processList();
+                return;
+            }
+            await goBackToList();
+            await processList();
+        }
+
+        async function goBackToList() {
+            setStatus('Going back...');
+            await delay(1000);
+            if (history.length > 1) {
+                history.back();
+                await delay(3000);
+                if (!document.body.innerText.includes('Tracking Number')) return;
+            }
+            setStatus('Back failed.');
+        }
+
+        async function main() {
+            const state = localStorage.getItem(STATE_KEY) || 'IDLE';
+            console.log('[LBC Auto] State:', state, '| URL:', location.href);
+
+            switch (state) {
+                case 'LOGIN': await processLogin(); break;
+                case 'POST_LOGIN': await handlePostLogin(); break;
+                case 'LOGOUT': await handleLogout(); break;
+                case 'DETAIL': await processDetail(); break;
+                case 'LIST': await processList(); break;
+                default: setStatus('Idle. Press START.'); break;
+            }
+        }
+
+        document.getElementById('lbcfullauto-start').addEventListener('click', async () => {
+            state_proc_stop = false;
+
+            if (getAutoAll()) {
+                const accounts = getAccounts();
+                if (accounts.length === 0) {
+                    alert('No accounts saved. Open ⚙ SETTINGS first.');
+                    return;
+                }
+                if (!confirm(`Start Auto All Once with ${accounts.length} account(s)?`)) return;
+
+                setAccountIndex(0);
+                localStorage.setItem(STATE_KEY, 'LOGIN');
+                applyAlertSuppression();
+
+                if (isOnLoginPage()) {
+                    await processLogin();
+                } else {
+                    window.location.href = getLoginUrl();
+                }
+                return;
+            }
+            const state = localStorage.getItem(STATE_KEY) || 'IDLE';
+            if (state === 'LIST' || state === 'IDLE') {
+                localStorage.setItem(STATE_KEY, 'LIST');
+                await processList();
+            } else {
+                setStatus('Currently in ' + state + ' state.');
+            }
+        });
+
+        document.getElementById('lbcfullauto-pause').addEventListener('click', () => {
+            state_proc_stop = true;
+            localStorage.setItem(STATE_KEY, 'IDLE');
+            setStatus('⏸ Paused');
+        });
+
+        document.getElementById('lbcfullauto-reset').addEventListener('click', () => {
+            if (!confirm('🛑 Reset ALL data and STOP all operations?\n\n(Accounts + toggles kept)')) return;
+
+            state_proc_stop = true;
+            setAutoAll(false);
+            const chkAuto = document.getElementById('lbcfullauto-auto-all');
+            if (chkAuto) chkAuto.checked = false;
+
+            [STORAGE_KEY, LIST_KEY, INDEX_KEY, FLAG_RETURNED,
+             MANIFEST_ID_KEY, MANIFEST_ZONE_KEY, MANIFEST_DATETIME_KEY, ACCOUNT_INDEX_KEY]
+                .forEach(k => localStorage.removeItem(k));
+
+            localStorage.setItem(STATE_KEY, 'IDLE');
+
+            setCustomDate('');
+            const dp = document.getElementById('lbcfullauto-date-picker');
+            if (dp) dp.value = todayInputValue();
+            updateDateLabel();
+
+            updateCount();
+            setStatus('🛑 Reset done – all operations stopped');
+            console.log('[LBC Auto] RESET: all operations stopped');
+        });
+
+        document.getElementById('lbcfullauto-copy').addEventListener('click', async () => {
+            const records = getStoredRecords();
+            if (records.length === 0) { setStatus('No records.'); return; }
+
+            const sf = (v) => String(v == null ? '' : v)
+                .replace(/[\r\n]+/g, ' ')
+                .replace(/\t+/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const valid = records.filter(r => {
+                const m = sf(r.manifest);
+                const t = sf(r.trn);
+                return m && t && m !== 'undefined' && t !== 'undefined';
+            });
+            if (valid.length === 0) { setStatus('No valid records.'); return; }
+            const lines = valid.map(r =>
+                `'${sf(r.manifest)}\t${sf(r.dateTime)}\t${sf(r.zone)}\t${sf(r.trn)}\t${sf(r.product)}\t${sf(r.qty)}\t${sf(r.amount)}\t${sf(r.consignee)}\t${sf(r.username)}`
+            );
+            await navigator.clipboard.writeText(lines.join('\n'));
+            setStatus(`📋 Copied ${lines.length} records`);
+        });
+
+        const chkSkip = document.getElementById('lbcfullauto-skip-duplicates');
+        chkSkip.checked = getSkipDuplicates();
+        chkSkip.addEventListener('change', function () {
+            setSkipDuplicates(this.checked);
+            setStatus(`Skip Duplicates: ${this.checked ? 'ON' : 'OFF'}`);
+        });
+
+        const chkLink = document.getElementById('lbcfullauto-link-method');
+        chkLink.checked = getLinkMethod();
+        chkLink.addEventListener('change', function () {
+            setLinkMethod(this.checked);
+            setStatus(`Link Method: ${this.checked ? 'ON' : 'OFF'}`);
+        });
+
+        const chkAuto = document.getElementById('lbcfullauto-auto-all');
+        chkAuto.checked = getAutoAll();
+        chkAuto.addEventListener('change', function () {
+            setAutoAll(this.checked);
+            setStatus(`Auto All Once: ${this.checked ? 'ON' : 'OFF'}`);
+            if (this.checked) {
+                applyAlertSuppression();
+                const a = getAccounts();
+                if (a.length === 0) {
+                    setTimeout(() => {
+                        alert('No accounts yet – opening Settings.');
+                        renderAccounts();
+                        modal.style.display = 'flex';
+                    }, 200);
+                }
+            }
+        });
+
+        const visible = localStorage.getItem('trn_panel_visible') !== 'false';
+        panel.style.display = visible ? 'block' : 'none';
+        document.addEventListener('keydown', e => {
+            if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'q') {
+                const hidden = panel.style.display === 'none';
+                panel.style.display = hidden ? 'block' : 'none';
+                localStorage.setItem('trn_panel_visible', hidden);
+            }
+        });
+
+        updateCount();
+        main();
+    });
+})();
